@@ -6,28 +6,184 @@ A standalone guide to the concepts behind robot sensor data — how it's generat
 
 ## Table of Contents
 
-1. [How Robots Produce Data](#1-how-robots-produce-data)
-2. [Binary Serialization and CDR](#2-binary-serialization-and-cdr)
-3. [The MCAP Container Format](#3-the-mcap-container-format)
-4. [ROS 2 Message Types and Schemas](#4-ros-2-message-types-and-schemas)
-5. [Images in Robotics](#5-images-in-robotics)
-6. [3D Point Clouds](#6-3d-point-clouds)
-7. [Inertial Measurement Units (IMUs)](#7-inertial-measurement-units-imus)
-8. [Joint States and Robot Kinematics](#8-joint-states-and-robot-kinematics)
-9. [Coordinate Frames and Transforms](#9-coordinate-frames-and-transforms)
-10. [Quaternions and 3D Rotations](#10-quaternions-and-3d-rotations)
-11. [The Pinhole Camera Model](#11-the-pinhole-camera-model)
-12. [Time, Clocks, and Synchronization](#12-time-clocks-and-synchronization)
-13. [Episodes and Dataset Structure](#13-episodes-and-dataset-structure)
-14. [Columnar Storage with Parquet](#14-columnar-storage-with-parquet)
-15. [Putting It All Together](#15-putting-it-all-together)
-16. [Further Reading](#16-further-reading)
+1. [How Robots Produce Data](#1-how-robots-produce-data) — sensors, the data pipeline, ML infra analogies
+2. [ROS 2: The Robot Operating System](#2-ros-2-the-robot-operating-system) — pub-sub, message types, DDS
+3. [Binary Serialization and CDR](#3-binary-serialization-and-cdr) — the wire format for ROS 2 messages
+4. [The MCAP Container Format](#4-the-mcap-container-format) — chunks, indexes, the Parquet of robotics
+5. [ROS 2 Message Types In Depth](#5-ros-2-message-types-in-depth) — schemas, type naming, Imu definition
+6. [Images in Robotics](#6-images-in-robotics)
+7. [3D Point Clouds](#7-3d-point-clouds)
+8. [Inertial Measurement Units (IMUs)](#8-inertial-measurement-units-imus)
+9. [Joint States and Robot Kinematics](#9-joint-states-and-robot-kinematics)
+10. [Coordinate Frames and Transforms](#10-coordinate-frames-and-transforms)
+11. [Quaternions and 3D Rotations](#11-quaternions-and-3d-rotations)
+12. [The Pinhole Camera Model](#12-the-pinhole-camera-model)
+13. [Time, Clocks, and Synchronization](#13-time-clocks-and-synchronization)
+14. [Episodes and Dataset Structure](#14-episodes-and-dataset-structure)
+15. [Columnar Storage with Parquet](#15-columnar-storage-with-parquet)
+16. [Putting It All Together](#16-putting-it-all-together)
+17. [Further Reading](#17-further-reading)
 
 ---
 
 ## 1. How Robots Produce Data
 
-A robot is a collection of sensors and actuators connected by software. At every instant, each sensor independently captures a measurement and publishes it as a timestamped message. A typical mobile manipulator might produce:
+### If you're coming from data/ML infrastructure
+
+Robot data has a lot in common with the event-driven systems you already know, but the physical world adds constraints that software-only systems don't face. Here's a rough mapping to orient you:
+
+```
+ML Infra Concept              Robot Equivalent
+──────────────────────────────────────────────────────────────
+Microservice                  Sensor driver (a process that
+                              talks to hardware and emits events)
+Protobuf / Avro schema        ROS 2 .msg definition
+Kafka topic                   ROS 2 topic (named pub-sub channel)
+Kafka broker / event bus      DDS middleware (peer-to-peer, no broker)
+Protobuf serialization        CDR serialization (binary, schema-driven)
+Event (key + value + ts)      ROS 2 message (topic + CDR bytes + timestamp)
+Kafka consumer writing to S3  rosbag2 recorder writing to MCAP file
+Parquet file on S3            MCAP file on disk
+Parquet row group             MCAP chunk (compressed block of messages)
+Parquet footer / metadata     MCAP summary section (schemas, stats, index)
+```
+
+The fundamental difference: **in ML infra, events come from software and timing is mostly about ordering. In robotics, events come from physical sensors, and timing is about _when a physical measurement actually happened_ — because that determines whether two measurements can be meaningfully combined.**
+
+A camera frame and an IMU reading are only useful together if they describe the same physical instant. If they're 50ms apart, the robot may have moved, and combining them produces garbage. This is why so much of the robotics data stack is about timestamps, clocks, and synchronization.
+
+### The physical layer: sensors
+
+A robot has hardware sensors that convert physical phenomena into electrical signals:
+
+| Sensor | What it measures | Physical principle |
+|---|---|---|
+| Camera | Light intensity per pixel | Photons hit a CMOS/CCD sensor array |
+| Depth camera | Distance per pixel | Structured light or time-of-flight |
+| LiDAR | Distance + angle | Laser pulse round-trip time |
+| IMU | Acceleration + angular velocity | MEMS accelerometer + gyroscope |
+| Joint encoder | Motor shaft angle | Optical/magnetic position sensor |
+
+Each sensor has its own **clock crystal** (a tiny quartz oscillator), its own **sample rate**, and its own **latency** (time between physical measurement and data availability). The camera doesn't know or care that the IMU exists. They operate independently.
+
+### What each sensor actually produces
+
+Before anything gets serialized or transmitted, here's what each sensor outputs as raw data:
+
+**IMU** — 6 floating-point numbers, 200 times per second:
+```json
+{
+  "linear_acceleration": {"x": 0.0, "y": 0.0, "z": 9.81},
+  "angular_velocity":    {"x": 0.02, "y": -0.01, "z": 0.0},
+  "orientation":         {"x": 0, "y": 0, "z": 0, "w": 1}
+}
+```
+The accelerometer reads ~9.81 m/s² on Z at rest (gravity). The gyroscope reads near-zero (no rotation). The orientation is a quaternion (explained in Section 10).
+
+**Joint encoders** — parallel arrays of angles/velocities/torques, 100 times per second:
+```yaml
+joints:   ["waist", "shoulder", "elbow"]
+position: [0.0, 1.57, 0.75]    # radians
+velocity: [0.0, 0.1, 0.2]      # rad/s
+effort:   [0.0, 10.5, 5.2]     # Nm (torque)
+```
+
+**RGB camera** — a grid of pixel values, 30 times per second:
+```
+1920 x 1080 pixels, 3 channels (R, G, B), 1 byte each
+= 6,220,800 bytes per frame
+```
+
+**Depth camera** — a grid of distance values, 30 times per second:
+```
+640 x 480 pixels, 1 channel (distance), 2 bytes each (uint16, millimeters)
+= 614,400 bytes per frame
+Value 1200 means "the surface at this pixel is 1200mm = 1.2m away"
+Value 0 means "no reading" (too close, too far, or transparent surface)
+```
+
+**LiDAR** — a list of 3D points, 10 times per second:
+```python
+# Each point: x, y, z (meters) + intensity + ring_id
+# Typical scan: 30,000 - 300,000 points
+points = [(5.21, 0.3, -0.1, 0.8, 12), (5.22, 0.31, -0.1, 0.7, 12), ...]
+```
+
+**Transforms** — the spatial relationship between two parts of the robot:
+```json
+{
+  "parent_frame": "base_link",
+  "child_frame": "camera_link",
+  "translation": {"x": 0.1, "y": 0.0, "z": 0.5},
+  "rotation": {"x": 0, "y": 0, "z": 0, "w": 1}
+}
+```
+"The camera is 10cm forward and 50cm up from the robot's base, with no rotation."
+
+### The data pipeline: sensor to disk
+
+Here's the full path a single IMU reading takes from physical measurement to bytes on disk. This is the "event pipeline" of robotics:
+
+```
+Step 1: PHYSICAL MEASUREMENT
+   MEMS accelerometer detects 9.81 m/s² on Z axis
+   Gyroscope detects 0.02 rad/s on X axis
+   Sensor's internal ADC converts analog signal to digital values
+   Sensor's internal clock timestamps the sample
+                    │
+                    ▼
+Step 2: DRIVER (a userspace process on the robot's computer)
+   Reads raw values over I2C/SPI/USB from the sensor hardware
+   Packages them into a structured object:
+     Imu {
+       header: { stamp: {sec: 1700000000, nanosec: 500000000},
+                 frame_id: "imu_link" },
+       linear_acceleration: {x: 0.0, y: 0.0, z: 9.81},
+       angular_velocity: {x: 0.02, y: -0.01, z: 0.0},
+       orientation: {x: 0, y: 0, z: 0, w: 1},
+       orientation_covariance: [0.01, 0, 0, 0, 0.01, 0, 0, 0, 0.01],
+       ...
+     }
+                    │
+                    ▼
+Step 3: SERIALIZATION (CDR encoding)
+   The DDS middleware serializes the struct into a flat byte array:
+     [00 02 00 00]           ← CDR encapsulation header (little-endian)
+     [65 A0 C8 03 00 00 ...] ← sec, nanosec, frame_id, then all fields
+   Result: ~300 bytes of CDR-encoded data
+                    │
+                    ▼
+Step 4: PUBLISH (DDS middleware)
+   The driver calls rclcpp::Publisher::publish(imu_msg)
+   DDS sends the CDR bytes to all subscribers on topic "/imu/data"
+   This is peer-to-peer UDP multicast — no broker, unlike Kafka
+                    │
+                    ▼
+Step 5: SUBSCRIBE + RECORD (rosbag2 recorder)
+   The recording tool receives the CDR bytes from DDS
+   It wraps them into an MCAP message record:
+     {
+       channel_id: 3,           ← maps to topic "/imu/data"
+       log_time: 1700000000.501 ← recorder's wall-clock time (NOT sensor time)
+       publish_time: ...,
+       data: [the CDR bytes]
+     }
+   The message is appended to the current MCAP chunk
+                    │
+                    ▼
+Step 6: MCAP FILE ON DISK
+   When the chunk fills up (~1-4 MB), it's compressed (LZ4/Zstd)
+   and flushed to the .mcap file.
+   When recording stops, the summary section is written:
+     - Schema records (what message types exist)
+     - Channel records (what topics exist, which schema each uses)
+     - Chunk index (which time ranges are in which chunks)
+     - Statistics (total message counts, time range)
+```
+
+**The key insight:** there are TWO timestamps. `header.stamp` (Step 2) is when the sensor physically took the measurement. `log_time` (Step 5) is when the recorder wrote it to disk. The difference is the pipeline latency — typically 0.5-5ms, but it varies per message. For synchronizing sensors with each other, you always want `header.stamp`.
+
+### Bandwidth reality check
 
 ```
 Sensor            Rate      Message Size    Bandwidth
@@ -40,76 +196,9 @@ LiDAR              10 Hz    ~2 MB           20 MB/s
 TF transforms      50 Hz    ~200 bytes      10 KB/s
 ```
 
-### 🧩 Data Structure Examples
-
-#### 1. IMU (Inertial Measurement Unit)
-* **Description:** Measures linear acceleration and angular velocity.
-* **Structure:**
-    ```json
-    {
-      "linear_acceleration": {"x": 0.0, "y": 0.0, "z": 9.81},
-      "angular_velocity": {"x": 0.02, "y": -0.01, "z": 0.0},
-      "orientation": {"x": 0, "y": 0, "z": 0, "w": 1}
-    }
-    ```
-
-#### 2. Joint Encoders
-* **Description:** Reports the physical state of the robot's actuators.
-* **Structure:**
-    ```yaml
-    joints: ["waist", "shoulder", "elbow"]
-    position: [0.0, 1.57, 0.75] # Radians
-    velocity: [0.0, 0.1, 0.2]   # Rad/s
-    effort: [0.0, 10.5, 5.2]    # Nm (Torque)
-    ```
-
-#### 3. RGB Camera
-* **Description:** Raw visual color stream.
-* **Structure:**
-    ```text
-    Format: 1920x1080 (RGB8)
-    Data: [ [R,G,B], [R,G,B], [R,G,B] ... ] 
-    # Represents a 2D matrix of 2,073,600 color pixels
-    ```
-
-#### 4. Depth Camera
-* **Description:** Per-pixel distance information.
-* **Structure:**
-    ```text
-    Format: 640x480 (Uint16)
-    Data: [ 1200, 1205, 1210, 0, 1215 ... ] 
-    # Integer values represent distance in millimeters
-    ```
-
-#### 5. LiDAR (Light Detection and Ranging)
-* **Description:** 2D or 3D point cloud of the environment.
-* **Structure:**
-    ```python
-    # LaserScan Parameters
-    range_min: 0.1
-    range_max: 30.0
-    ranges: [5.21, 5.22, 5.25, 10.1, "inf"] # Array of distances
-    ```
-
-#### 6. TF Transforms
-* **Description:** Coordinate transformations between robot components.
-* **Structure:**
-    ```json
-    {
-      "parent_frame": "base_link",
-      "child_frame": "camera_link",
-      "translation": {"x": 0.1, "y": 0.0, "z": 0.5},
-      "rotation": {"x": 0, "y": 0, "z": 0, "w": 1}
-    }
-    ```
+Cameras dominate. A 10-minute recording with one RGB camera and one depth camera is ~150 GB uncompressed. With JPEG compression for RGB and LZ4 for the MCAP container, that drops to ~5-15 GB. This is why `CompressedImage` (JPEG bytes inside a ROS message) is far more common than raw `Image` in real datasets.
 
 These streams are **asynchronous** — each sensor has its own clock, its own sample rate, and its own latency path through the software stack. There is no global "tick" that makes all sensors fire simultaneously. This is the fundamental challenge of robot data: **bringing independent, heterogeneous, asynchronous streams into alignment**.
-
-### The recording pipeline
-
-In ROS 2, sensor data flows through a publish-subscribe middleware called DDS (Data Distribution Service). Each sensor driver publishes messages to named **topics** (e.g., `/camera/color/image_raw`). A recording tool subscribes to all topics of interest and writes incoming messages into a file.
-
-The standard file format for ROS 2 recordings is **MCAP**. Before MCAP, ROS 1 used `.bag` files (a simpler, less efficient format). MCAP adds features that matter at scale: chunk-based compression, a summary index for fast random access, and support for multiple serialization formats.
 
 ### Why not just use a video file?
 
@@ -122,17 +211,141 @@ A robot recording is fundamentally different from a video:
 
 ---
 
-## 2. Binary Serialization and CDR
+## 2. ROS 2: The Robot Operating System
+
+Before we get into serialization formats and file layouts, you need to understand what **ROS 2** actually is, because it's the system that defines how all this data is structured.
+
+### What ROS 2 is (and isn't)
+
+ROS 2 (Robot Operating System 2) is **not an operating system**. It's a middleware framework — a set of libraries, tools, and conventions that standardize how robot software is written. It runs on top of Linux (or macOS/Windows).
+
+Think of it as the "Spring Boot of robotics": it provides dependency injection (launch files), inter-process communication (topics/services), a type system (`.msg` definitions), and an ecosystem of reusable components (sensor drivers, SLAM algorithms, motion planners).
+
+### The publish-subscribe model
+
+ROS 2 applications are composed of **nodes** — independent processes that communicate through **topics** using publish-subscribe:
+
+```
+                        Topic: /imu/data
+   ┌──────────┐        (sensor_msgs/Imu)         ┌──────────┐
+   │ IMU      │ ─────────────────────────────────▶│ SLAM     │
+   │ Driver   │                                   │ Node     │
+   └──────────┘                                   └──────────┘
+                                                       ▲
+   ┌──────────┐     Topic: /camera/image_raw           │
+   │ Camera   │ ─────────────────────────────────▶     │
+   │ Driver   │     (sensor_msgs/Image)                │
+   └──────────┘                                        │
+                                                       │
+   ┌──────────┐     Topic: /joint_states               │
+   │ Joint    │ ─────────────────────────────────▶     │
+   │ Driver   │     (sensor_msgs/JointState)     ┌─────┴────┐
+   └──────────┘                                  │ rosbag2  │
+                                                 │ recorder │
+         All topics are also received by ────────▶ (writes  │
+         the recorder for logging to disk         │  MCAP)  │
+                                                 └──────────┘
+```
+
+Every topic has a **name** (like `/camera/color/image_raw`) and a **message type** (like `sensor_msgs/msg/Image`). The message type is fixed for a topic — you can't publish an IMU reading on a camera topic.
+
+### How ROS 2 relates to DDS
+
+Under the hood, ROS 2 topics are implemented using **DDS** (Data Distribution Service), an industry-standard pub-sub middleware. DDS handles:
+
+- **Discovery** — nodes automatically find each other on the network (no broker needed, unlike Kafka)
+- **Transport** — messages are sent over UDP multicast or shared memory
+- **QoS** — configurable reliability, durability, and deadline policies (similar to Kafka retention/ack settings)
+- **Serialization** — messages are encoded as CDR bytes (explained in Section 3)
+
+You don't need to know DDS to use ROS 2 data — just know that it's the reason messages are CDR-encoded and that topics are the core data transport abstraction.
+
+### Message types: the schema system
+
+Every ROS 2 message type is defined in a `.msg` file — a simple DSL that's conceptually similar to Protobuf `.proto` files:
+
+```protobuf
+// For comparison — this is Protobuf syntax
+message Imu {
+  Header header = 1;
+  Quaternion orientation = 2;
+  repeated double orientation_covariance = 3;
+  Vector3 angular_velocity = 4;
+  ...
+}
+```
+
+```
+# This is the actual ROS 2 .msg syntax
+std_msgs/Header header
+
+geometry_msgs/Quaternion orientation
+float64[9] orientation_covariance
+
+geometry_msgs/Vector3 angular_velocity
+float64[9] angular_velocity_covariance
+
+geometry_msgs/Vector3 linear_acceleration
+float64[9] linear_acceleration_covariance
+```
+
+Key differences from Protobuf:
+- **No field numbers** — fields are identified by position, not by tag. This means you can't add/remove fields without breaking the schema (no backwards compatibility).
+- **No optional/required** — all fields are always present.
+- **Fixed-size arrays** — `float64[9]` is always exactly 9 elements. Variable-length arrays use `float64[]` (no size bound in the schema).
+
+### The Header: every message's metadata
+
+Nearly every sensor message includes a `std_msgs/Header`:
+
+```
+builtin_interfaces/Time stamp
+string frame_id
+```
+
+- **stamp** — when the measurement was taken (sensor time, not recording time)
+- **frame_id** — which coordinate frame this data lives in (e.g., `"camera_optical_frame"`, `"imu_link"`)
+
+The header is the bridge between the data stream (what was measured) and the spatial system (where it was measured). Without `frame_id`, you can't place the data in 3D space. Without `stamp`, you can't align it with other sensors.
+
+### Why this matters for reading MCAP files
+
+When you open an MCAP file, you're looking at the output of this entire system:
+- **Schemas** in the MCAP correspond to `.msg` definitions
+- **Channels** correspond to topics (name + message type)
+- **Messages** are CDR-encoded instances of those types
+- **Timestamps** come from both the message header (sensor time) and the recording system (log time)
+
+Understanding this lineage — physical sensor → driver → message type → CDR bytes → DDS transport → MCAP chunk — is what makes the rest of this document make sense.
+
+---
+
+## 3. Binary Serialization and CDR
+
+Now that you know where messages come from (sensors → drivers → topics), let's look at how they're encoded into bytes for transport and storage.
 
 ### What is serialization?
 
-When a sensor driver wants to publish an IMU reading, it has a structured object in memory — a C++ struct or Python dataclass with fields like `angular_velocity.x`, `angular_velocity.y`, etc. To send this over a network (or write it to disk), those fields must be packed into a contiguous byte sequence. This is **serialization**. The reverse — reconstructing the structured object from bytes — is **deserialization**.
+When a sensor driver publishes an IMU reading, it has a structured object in memory — a C++ struct or Python dataclass with fields like `angular_velocity.x`, `angular_velocity.y`, etc. To send this over a network (or write it to disk), those fields must be packed into a contiguous byte sequence. This is **serialization**. The reverse — reconstructing the structured object from bytes — is **deserialization**.
+
+If you've worked with Protobuf, this is the same idea — just a different wire format.
 
 ### CDR: Common Data Representation
 
 ROS 2 uses CDR (Common Data Representation) as its serialization format. CDR comes from CORBA (Common Object Request Broker Architecture), a 1990s distributed computing standard. ROS 2 adopted it through DDS, which inherited CORBA's wire format.
 
-CDR is a **binary** format (not text like JSON or XML). A float64 value occupies exactly 8 bytes. There are no field names, no delimiters, no whitespace. The byte layout is fully determined by the message schema — if you know the schema, you can walk through the bytes field by field.
+**How CDR compares to formats you know:**
+
+```
+Format      Field IDs?   Self-describing?   Alignment?   Typical use
+──────────────────────────────────────────────────────────────────────
+JSON        By name      Yes                No           REST APIs
+Protobuf    By tag #     Partially          No           gRPC, storage
+Avro        By position  Schema in header   No           Kafka, Spark
+CDR         By position  Schema out-of-band Yes          DDS / ROS 2
+```
+
+CDR is a **positional binary** format. A float64 value occupies exactly 8 bytes. There are no field names, no delimiters, no whitespace. The byte layout is fully determined by the message schema — if you know the schema, you can walk through the bytes field by field. This is why schemas and messages are stored together in the MCAP file.
 
 ### Alignment padding
 
@@ -154,6 +367,8 @@ string      varies  4 (for the length prefix)
 - **Slow** on x86 (the CPU must perform two memory reads and stitch the bytes together)
 
 CDR's alignment rules guarantee that a receiver can cast a pointer directly into the byte buffer and read native types without any unaligned access penalty. The cost is a few wasted padding bytes between fields.
+
+If you've ever dealt with Arrow or Parquet's internal alignment requirements for SIMD processing, this is the same principle applied at the serialization level.
 
 ### Example: how an IMU header is encoded
 
@@ -180,7 +395,7 @@ Offset  Bytes           Field           Notes
 0x18    6B 00           "k\0"           1 char + null terminator
 ```
 
-Notice: `sec` starts at offset 0x04 (4-byte aligned ✓), `nanosec` at 0x08 (4-byte aligned ✓), the string length at 0x0C (4-byte aligned ✓). No padding was needed here because consecutive uint32 fields are naturally aligned. But if you had a `uint8` followed by a `uint32`, there would be 3 padding bytes between them.
+Notice: `sec` starts at offset 0x04 (4-byte aligned), `nanosec` at 0x08 (4-byte aligned), the string length at 0x0C (4-byte aligned). No padding was needed here because consecutive uint32 fields are naturally aligned. But if you had a `uint8` followed by a `uint32`, there would be 3 padding bytes between them.
 
 ### The encapsulation header
 
@@ -215,9 +430,27 @@ The `count` is the number of elements, not the byte length. Each element follows
 
 ---
 
-## 3. The MCAP Container Format
+## 4. The MCAP Container Format
 
-MCAP wraps serialized messages into an indexed, seekable container. Think of it as a database file optimized for time-series sensor data.
+Now you know: sensors produce structured data (Section 1), ROS 2 defines the types and pub-sub transport (Section 2), and CDR is the wire encoding (Section 3). The last piece of the pipeline is **storage**: how do all those CDR-encoded messages end up in a file you can read offline?
+
+### MCAP is the Parquet of robotics
+
+If you know Parquet, you already understand the key ideas behind MCAP:
+
+```
+Parquet                         MCAP
+──────────────────────────────────────────────────────────
+Row group                       Chunk (compressed block)
+Column chunk                    Messages from one channel in a chunk
+Page                            Individual message
+Schema / footer metadata        Summary section (schemas, channels, stats)
+Row group offset index          Chunk index (time range → file offset)
+Column statistics (min/max)     Statistics record (counts, time range)
+Compression (Snappy/Zstd)       Compression (LZ4/Zstd)
+```
+
+The core design principle is the same: **write data in compressed blocks, then write an index at the end so readers can skip to exactly what they need without scanning the whole file.**
 
 ### File structure
 
@@ -229,8 +462,8 @@ MCAP wraps serialized messages into an indexed, seekable container. Think of it 
 ├─────────────────────────────────┤
 │ Data Section                    │
 │  ┌───────────────────────────┐  │
-│  │ Schema records            │  │  Message type definitions
-│  │ Channel records           │  │  Topic → schema mappings
+│  │ Schema records            │  │  Message type definitions (.msg content)
+│  │ Channel records           │  │  Topic name → schema ID mappings
 │  │ Chunk 1                   │  │  Compressed block of messages
 │  │ Chunk 2                   │  │
 │  │ ...                       │  │
@@ -255,15 +488,15 @@ MCAP wraps serialized messages into an indexed, seekable container. Think of it 
 
 ### Key concepts
 
-**Schema** — the type definition for a message. For ROS 2, this is the `.msg` file content (e.g., the definition of `sensor_msgs/Imu`). A schema is registered once in the file and referenced by ID.
+**Schema** — the type definition for a message. For ROS 2, this is the `.msg` file content (e.g., the definition of `sensor_msgs/Imu`). A schema is registered once in the file and referenced by ID. Think of it like a Protobuf descriptor embedded in the file.
 
-**Channel** — a named stream of messages with a specific schema. In ROS 2 terms, this is a topic: `/imu/data` is a channel whose schema is `sensor_msgs/Imu`. Multiple channels can share the same schema (e.g., `/left_camera/image` and `/right_camera/image` both use `sensor_msgs/Image`).
+**Channel** — a named stream of messages with a specific schema. In ROS 2 terms, this is a topic: `/imu/data` is a channel whose schema is `sensor_msgs/Imu`. Multiple channels can share the same schema (e.g., `/left_camera/image` and `/right_camera/image` both use `sensor_msgs/Image`). A channel is like a Kafka topic partition — a single ordered stream of typed events.
 
-**Chunk** — a compressed block of sequential messages from potentially many channels. Chunks are the unit of compression (LZ4 or Zstd). To read a specific message, you decompress its entire chunk. Chunk sizes are tunable — larger chunks compress better but require decompressing more data for random access.
+**Chunk** — a compressed block of sequential messages from potentially many channels. Chunks are the unit of compression (LZ4 or Zstd). To read a specific message, you decompress its entire chunk. Chunk sizes are tunable — larger chunks compress better but require decompressing more data for random access. This is the same tradeoff as Parquet row group sizing.
 
-**Message Index** — an offset table that maps (channel_id, timestamp) → byte offset within a chunk. This is what makes random access fast: to find all IMU messages between t=10s and t=20s, the reader scans the message indices (cheap) rather than decompressing every chunk (expensive).
+**Message Index** — an offset table that maps (channel_id, timestamp) → byte offset within a chunk. This is what makes random access fast: to find all IMU messages between t=10s and t=20s, the reader scans the message indices (cheap) rather than decompressing every chunk (expensive). This is like Parquet's page offset index.
 
-**Statistics** — a single record in the summary section containing the total message count, time range, and per-channel message counts. This is how `mcap-reader summary` can print file stats without reading any message data.
+**Statistics** — a single record in the summary section containing the total message count, time range, and per-channel message counts. This is how `mcap-reader summary` can print file stats without reading any message data — just like reading Parquet metadata without scanning row groups.
 
 ### Why chunks matter
 
@@ -275,11 +508,40 @@ MCAP includes CRC-32 checksums in chunks and the footer. This catches data corru
 
 ---
 
-## 4. ROS 2 Message Types and Schemas
+## 5. ROS 2 Message Types In Depth
 
-### The type system
+This section dives deeper into the specific message types you'll encounter. Section 2 introduced the type system; here we look at the actual fields and what they mean physically.
 
-ROS 2 has a strongly-typed message system. Every topic has a fixed message type, and every message type has a schema defined in a `.msg` file. For example, `sensor_msgs/msg/Imu`:
+### The type naming convention
+
+```
+package_name/msg/TypeName
+```
+
+Examples:
+- `sensor_msgs/msg/Image` — raw camera images
+- `sensor_msgs/msg/PointCloud2` — 3D point clouds
+- `sensor_msgs/msg/Imu` — inertial measurements
+- `sensor_msgs/msg/JointState` — robot joint angles/velocities/torques
+- `sensor_msgs/msg/CameraInfo` — camera calibration parameters
+- `tf2_msgs/msg/TFMessage` — coordinate frame transforms
+
+### Imu message definition
+
+```
+std_msgs/Header header
+
+geometry_msgs/Quaternion orientation
+float64[9] orientation_covariance
+
+geometry_msgs/Vector3 angular_velocity
+float64[9] angular_velocity_covariance
+
+geometry_msgs/Vector3 linear_acceleration
+float64[9] linear_acceleration_covariance
+```
+
+This is a hierarchical definition — `Imu` contains a `Header` (which itself contains a `Time` and a `string`), a `Quaternion`, etc. The CDR serializer flattens this hierarchy into a linear byte sequence using depth-first traversal.
 
 ```
 std_msgs/Header header
@@ -326,7 +588,7 @@ The header is the bridge between the data stream (what was measured) and the spa
 
 ---
 
-## 5. Images in Robotics
+## 6. Images in Robotics
 
 ### Raw vs compressed images
 
@@ -374,7 +636,7 @@ A depth pixel value of `3000` in a `mono16` image means "the surface at this pix
 
 ---
 
-## 6. 3D Point Clouds
+## 7. 3D Point Clouds
 
 ### What is PointCloud2?
 
@@ -410,7 +672,7 @@ The data buffer is simply `num_points × point_step` bytes of these packed struc
 
 ---
 
-## 7. Inertial Measurement Units (IMUs)
+## 8. Inertial Measurement Units (IMUs)
 
 ### What an IMU measures
 
@@ -432,7 +694,7 @@ Many IMUs also fuse these measurements internally to estimate **orientation** as
 
 ---
 
-## 8. Joint States and Robot Kinematics
+## 9. Joint States and Robot Kinematics
 
 ### What JointState contains
 
@@ -459,7 +721,7 @@ In imitation learning and reinforcement learning, the JointState is the **action
 
 ---
 
-## 9. Coordinate Frames and Transforms
+## 10. Coordinate Frames and Transforms
 
 ### The problem
 
@@ -511,7 +773,7 @@ A camera image arrives at t = 1.005s. The most recent `odom → base_link` trans
 
 ---
 
-## 10. Quaternions and 3D Rotations
+## 11. Quaternions and 3D Rotations
 
 ### Why not Euler angles?
 
@@ -582,7 +844,7 @@ ROS uses `(x, y, z, w)` ordering. SciPy uses `(w, x, y, z)` (scalar-first). This
 
 ---
 
-## 11. The Pinhole Camera Model
+## 12. The Pinhole Camera Model
 
 ### The basic model
 
@@ -685,7 +947,7 @@ In `CameraInfo`:
 
 ---
 
-## 12. Time, Clocks, and Synchronization
+## 13. Time, Clocks, and Synchronization
 
 ### The clock problem
 
@@ -747,7 +1009,7 @@ After synchronization, compute:
 
 ---
 
-## 13. Episodes and Dataset Structure
+## 14. Episodes and Dataset Structure
 
 ### What is an episode?
 
@@ -782,7 +1044,7 @@ Understanding MCAP deeply gives you the foundation to convert to/from any of the
 
 ---
 
-## 14. Columnar Storage with Parquet
+## 15. Columnar Storage with Parquet
 
 ### Why Parquet for robot data?
 
@@ -835,7 +1097,7 @@ PointCloud: timestamp_ns (int64), frame_id (string),
 
 ---
 
-## 15. Putting It All Together
+## 16. Putting It All Together
 
 Here's how all these concepts connect when you process a real robot recording:
 
@@ -881,7 +1143,7 @@ Each of these steps builds on the concepts covered in this document. The code in
 
 ---
 
-## 16. Further Reading
+## 17. Further Reading
 
 ### Specifications and standards
 - [MCAP format specification](https://mcap.dev/spec) — the official byte-level format definition
