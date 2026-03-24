@@ -200,14 +200,97 @@ Cameras dominate. A 10-minute recording with one RGB camera and one depth camera
 
 These streams are **asynchronous** — each sensor has its own clock, its own sample rate, and its own latency path through the software stack. There is no global "tick" that makes all sensors fire simultaneously. This is the fundamental challenge of robot data: **bringing independent, heterogeneous, asynchronous streams into alignment**.
 
-### Why not just use a video file?
+### Why not just use a video file (MP4 / H.264)?
 
-A robot recording is fundamentally different from a video:
+This is a natural question, especially since camera data dominates the bandwidth. If 95% of the bytes are pixels, why not just record a video?
 
-- **Multiple data modalities** — not just pixels, but also 3D points, inertial measurements, joint angles, and transform trees. No video codec handles this heterogeneity.
-- **Per-message timestamps** — each message carries the exact time the physical measurement was taken, with nanosecond resolution. Video formats have frame rates, not per-frame timestamps.
-- **Structured metadata** — each message has a schema describing its binary layout. A video frame is opaque bytes; a ROS message is self-describing.
-- **Random access by topic and time** — you can read just the IMU data from minute 5 to minute 7 without touching camera frames. Video formats require sequential decoding.
+To answer properly, you need to understand what MP4 and H.264 actually are and what tradeoffs they make.
+
+#### How video codecs work (the 60-second version)
+
+**MP4** is a container format (like MCAP). **H.264** (also called AVC) is a compression codec that goes inside MP4 (like CDR goes inside MCAP). H.265/HEVC and VP9/AV1 are newer codecs with better compression.
+
+Video codecs achieve 100-1000x compression (vs raw pixels) through two key tricks:
+
+1. **Spatial compression (intra-frame)** — within a single frame, nearby pixels are similar. Divide the frame into 16x16 blocks, predict each block from its neighbors, and encode only the prediction error. This is similar to JPEG.
+
+2. **Temporal compression (inter-frame)** — consecutive frames are nearly identical. Instead of encoding every frame independently, encode most frames as "the difference from the previous frame." This is where the big wins come from: a static background contributes zero bytes across hundreds of frames.
+
+This creates three types of frames:
+```
+I-frame (keyframe)    — fully self-contained, like a JPEG. Large.
+P-frame (predicted)   — encoded as delta from a previous frame. Small.
+B-frame (bidirectional) — encoded as delta from both past AND future frames. Smallest.
+
+Typical GOP (Group of Pictures):
+I  B  B  P  B  B  P  B  B  P  B  B  P  B  B  I  B  B  P ...
+│                                              │
+└──── keyframe every 30-60 frames ─────────────┘
+```
+
+**The critical consequence:** to decode frame N, you must first decode the nearest preceding I-frame, then every P-frame and B-frame between it and frame N. You can't jump to an arbitrary frame without this chain. This is fundamentally different from MCAP, where every message is independently decodable.
+
+#### What robotics needs vs. what video provides
+
+```
+Requirement                     Video (MP4/H.264)       MCAP + CompressedImage
+─────────────────────────────────────────────────────────────────────────────────
+Per-frame timestamp (ns)        No (fixed frame rate)    Yes (per-message)
+Dropped frame handling          Breaks decode chain      Just a missing message
+Random access to frame N        Decode from last I-frame Direct seek via index
+Pixel-exact values              No (lossy transforms)    Yes (JPEG/PNG are standard)
+Depth images (uint16/float32)   No (designed for 8-bit)  Yes (any dtype)
+Non-image data alongside        Separate file or hack    Same file, same timeline
+Multiple cameras in one file    Separate tracks           Separate topics
+Variable frame rate             Poorly supported          Natural (async messages)
+Compression ratio (RGB)         ~200-500x (H.264)        ~10-50x (per-frame JPEG)
+```
+
+#### Where video codecs break down for robotics
+
+**1. Lossy temporal compression destroys pixel-exact reproducibility.**
+
+H.264 doesn't store your actual pixels — it stores a compressed approximation that looks good to human eyes. Each frame is decoded by applying motion vectors and residuals to a reference frame, accumulating floating-point rounding errors. The exact decoded pixel values depend on the decoder implementation. Two decoders can produce slightly different outputs from the same H.264 stream.
+
+For a YouTube video, this is fine. For a robot learning pipeline where you're computing optical flow, projecting depth points, or training a policy on pixel observations, it's a problem. You need bit-exact reproducibility: the same bytes should always decode to the same pixels. JPEG and PNG inside MCAP give you this.
+
+**2. Depth images are not 8-bit color.**
+
+Video codecs are designed for human-visible light: 8 bits per channel, 3 channels (YUV or RGB). A depth image from a RealSense camera is `uint16` (millimeters) or `float32` (meters) — one channel, 16 or 32 bits, with values like `3042` meaning "3.042 meters." Feeding this through H.264 would:
+- Clamp to 8-bit (0-255), destroying all depth information beyond 2.55 meters
+- Apply perceptual-model-based compression that's optimized for human vision, not distance measurements
+- Introduce spatial artifacts that corrupt the geometric structure
+
+**3. The inter-frame dependency chain is fragile.**
+
+If a camera driver drops frame 47 (common under CPU load), H.264 has a problem: frames 48-59 were encoded as deltas from frame 47. The entire chain is corrupted until the next I-frame. The decoder either produces visual artifacts or must discard the whole group.
+
+In MCAP with per-frame JPEG, a dropped frame is just... a gap. Frame 46 is fine, frame 48 is fine. Nothing depends on frame 47 existing.
+
+**4. Per-frame timestamps are essential, not optional.**
+
+Video formats encode time as a frame rate (30fps) or a timebase with DTS/PTS (decode/presentation timestamps). These work well for playback but have two problems for robotics:
+
+- **Variable capture rate:** a camera running at "30 fps" doesn't actually fire every 33.333ms. Real intervals are 31-36ms due to USB scheduling, exposure time variation, and OS jitter. Video formats either assume fixed rate (wrong) or encode timestamps with limited precision (microseconds, not nanoseconds).
+- **Cross-sensor alignment:** to synchronize a camera frame with an IMU reading, you need to compare their timestamps at sub-millisecond precision. Video timestamps are designed for A/V sync (audio vs video, ~40ms tolerance), not multi-sensor fusion (~1ms tolerance).
+
+#### When video formats ARE useful in robotics
+
+Video formats aren't useless — they serve real purposes in specific contexts:
+
+**Visualization and review.** When a human needs to watch what the robot did, MP4 is great. Foxglove Studio, RViz, and most robot dashboards can render MCAP image topics into video for review. The key point: convert to video for viewing, but store as MCAP for processing.
+
+**Network streaming.** If you're teleoperating a robot over a network link, H.264/H.265 encoding is essential — you can't send 180 MB/s of raw RGB over a typical network. ROS 2 has packages like `image_transport` that do H.264 encoding for real-time streaming, then decode back to raw images on the receiving end. But the recorded data is still stored as individual frames, not as a video stream.
+
+**Long-term archival of visual-only data.** If you have a dataset of 10,000 hours of robot camera footage and you only need the visual data (no depth, no synchronization with other sensors), H.264 compression at 200-500x is much more storage-efficient than per-frame JPEG at 10-50x. Some large-scale datasets (like Ego4D for egocentric video) use MP4 for this reason. But they sacrifice the properties above in exchange for storage savings.
+
+**Diffusion model training on video.** Some recent robot learning approaches (video prediction models, world models) explicitly want video-style data with temporal coherence. These might ingest MP4 directly. But even here, the training pipeline typically decodes to individual frames internally and handles timestamps separately.
+
+#### The bottom line
+
+Video codecs are optimized for a different problem: compressing a single continuous stream of 8-bit color frames for human viewing at a fixed rate. Robotics data is multi-modal, multi-rate, variable-timing, and needs pixel-exact values across diverse dtypes. MCAP with per-frame compression (JPEG for RGB, raw for depth) hits the right tradeoff: good enough compression (~10-50x), full timestamp fidelity, independent frame access, and dtype preservation.
+
+The robotics community arrived at this design through painful experience with video-encoded datasets that broke downstream pipelines in subtle ways (shifted timestamps, decoder-dependent pixel values, corrupted depth channels). The extra storage cost of per-frame encoding is the price of correctness.
 
 ---
 
