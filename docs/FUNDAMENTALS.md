@@ -40,6 +40,69 @@ LiDAR              10 Hz    ~2 MB           20 MB/s
 TF transforms      50 Hz    ~200 bytes      10 KB/s
 ```
 
+### 🧩 Data Structure Examples
+
+#### 1. IMU (Inertial Measurement Unit)
+* **Description:** Measures linear acceleration and angular velocity.
+* **Structure:**
+    ```json
+    {
+      "linear_acceleration": {"x": 0.0, "y": 0.0, "z": 9.81},
+      "angular_velocity": {"x": 0.02, "y": -0.01, "z": 0.0},
+      "orientation": {"x": 0, "y": 0, "z": 0, "w": 1}
+    }
+    ```
+
+#### 2. Joint Encoders
+* **Description:** Reports the physical state of the robot's actuators.
+* **Structure:**
+    ```yaml
+    joints: ["waist", "shoulder", "elbow"]
+    position: [0.0, 1.57, 0.75] # Radians
+    velocity: [0.0, 0.1, 0.2]   # Rad/s
+    effort: [0.0, 10.5, 5.2]    # Nm (Torque)
+    ```
+
+#### 3. RGB Camera
+* **Description:** Raw visual color stream.
+* **Structure:**
+    ```text
+    Format: 1920x1080 (RGB8)
+    Data: [ [R,G,B], [R,G,B], [R,G,B] ... ] 
+    # Represents a 2D matrix of 2,073,600 color pixels
+    ```
+
+#### 4. Depth Camera
+* **Description:** Per-pixel distance information.
+* **Structure:**
+    ```text
+    Format: 640x480 (Uint16)
+    Data: [ 1200, 1205, 1210, 0, 1215 ... ] 
+    # Integer values represent distance in millimeters
+    ```
+
+#### 5. LiDAR (Light Detection and Ranging)
+* **Description:** 2D or 3D point cloud of the environment.
+* **Structure:**
+    ```python
+    # LaserScan Parameters
+    range_min: 0.1
+    range_max: 30.0
+    ranges: [5.21, 5.22, 5.25, 10.1, "inf"] # Array of distances
+    ```
+
+#### 6. TF Transforms
+* **Description:** Coordinate transformations between robot components.
+* **Structure:**
+    ```json
+    {
+      "parent_frame": "base_link",
+      "child_frame": "camera_link",
+      "translation": {"x": 0.1, "y": 0.0, "z": 0.5},
+      "rotation": {"x": 0, "y": 0, "z": 0, "w": 1}
+    }
+    ```
+
 These streams are **asynchronous** — each sensor has its own clock, its own sample rate, and its own latency path through the software stack. There is no global "tick" that makes all sensors fire simultaneously. This is the fundamental challenge of robot data: **bringing independent, heterogeneous, asynchronous streams into alignment**.
 
 ### The recording pipeline
