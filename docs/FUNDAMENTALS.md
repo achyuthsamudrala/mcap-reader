@@ -2,27 +2,38 @@
 
 A standalone guide to the concepts behind robot sensor data — how it's generated, encoded, stored, synchronized, and spatially referenced. Read this before (or alongside) the code.
 
+This guide is structured as a narrative, not a reference manual. It follows the journey of robot data from physical measurement to training-ready dataset, introducing each concept when you first need it.
+
 ---
 
 ## Table of Contents
 
+### Part I — How Robot Data Gets to Disk
 1. [How Robots Produce Data](#1-how-robots-produce-data) — sensors, the data pipeline, ML infra analogies
 2. [ROS 2: The Robot Operating System](#2-ros-2-the-robot-operating-system) — pub-sub, message types, DDS
 3. [Binary Serialization and CDR](#3-binary-serialization-and-cdr) — the wire format for ROS 2 messages
 4. [The MCAP Container Format](#4-the-mcap-container-format) — chunks, indexes, the Parquet of robotics
-5. [ROS 2 Message Types In Depth](#5-ros-2-message-types-in-depth) — schemas, type naming, Imu definition
-6. [Images in Robotics](#6-images-in-robotics)
-7. [3D Point Clouds](#7-3d-point-clouds)
-8. [Inertial Measurement Units (IMUs)](#8-inertial-measurement-units-imus)
-9. [Joint States and Robot Kinematics](#9-joint-states-and-robot-kinematics)
-10. [Coordinate Frames and Transforms](#10-coordinate-frames-and-transforms)
-11. [Quaternions and 3D Rotations](#11-quaternions-and-3d-rotations)
-12. [The Pinhole Camera Model](#12-the-pinhole-camera-model)
-13. [Time, Clocks, and Synchronization](#13-time-clocks-and-synchronization)
-14. [Episodes and Dataset Structure](#14-episodes-and-dataset-structure)
-15. [Columnar Storage with Parquet](#15-columnar-storage-with-parquet)
-16. [Putting It All Together](#16-putting-it-all-together)
-17. [Further Reading](#17-further-reading)
+5. [Why Not Just Use Video?](#5-why-not-just-use-video) — MP4/H.264 tradeoffs for robot data
+
+### Part II — What's Inside a Recording
+6. [Sensor Data Types](#6-sensor-data-types) — Images, point clouds, IMUs, joint states, and how to decode them
+7. [Where Things Are: Coordinate Frames and Transforms](#7-where-things-are-coordinate-frames-and-transforms) — the spatial backbone
+8. [Quaternions and 3D Rotations](#8-quaternions-and-3d-rotations) — the math behind transforms
+9. [The Pinhole Camera Model](#9-the-pinhole-camera-model) — projecting 3D into 2D and back
+
+### Part III — Making the Data Useful
+10. [Time, Clocks, and Synchronization](#10-time-clocks-and-synchronization) — aligning asynchronous sensor streams
+11. [Episodes and Dataset Structure](#11-episodes-and-dataset-structure) — from continuous recordings to training data
+12. [Columnar Storage with Parquet](#12-columnar-storage-with-parquet) — the export format for ML
+
+13. [Putting It All Together](#13-putting-it-all-together)
+14. [Further Reading](#14-further-reading)
+
+---
+
+# Part I — How Robot Data Gets to Disk
+
+*Sections 1-5 follow a single data point — an IMU reading — from the moment the physical measurement happens to the moment it's stored as bytes on disk. By the end, you'll understand every layer of the stack: hardware sensor → driver → ROS message → CDR bytes → DDS transport → MCAP file.*
 
 ---
 
@@ -78,7 +89,7 @@ Before anything gets serialized or transmitted, here's what each sensor outputs 
   "orientation":         {"x": 0, "y": 0, "z": 0, "w": 1}
 }
 ```
-The accelerometer reads ~9.81 m/s² on Z at rest (gravity). The gyroscope reads near-zero (no rotation). The orientation is a quaternion (explained in Section 10).
+The accelerometer reads ~9.81 m/s² on Z at rest (gravity). The gyroscope reads near-zero (no rotation). The orientation is a quaternion (explained in Section 8).
 
 **Joint encoders** — parallel arrays of angles/velocities/torques, 100 times per second:
 ```yaml
@@ -198,105 +209,11 @@ TF transforms      50 Hz    ~200 bytes      10 KB/s
 
 Cameras dominate. A 10-minute recording with one RGB camera and one depth camera is ~150 GB uncompressed. With JPEG compression for RGB and LZ4 for the MCAP container, that drops to ~5-15 GB. This is why `CompressedImage` (JPEG bytes inside a ROS message) is far more common than raw `Image` in real datasets.
 
-These streams are **asynchronous** — each sensor has its own clock, its own sample rate, and its own latency path through the software stack. There is no global "tick" that makes all sensors fire simultaneously. This is the fundamental challenge of robot data: **bringing independent, heterogeneous, asynchronous streams into alignment**.
-
-### Why not just use a video file (MP4 / H.264)?
-
-This is a natural question, especially since camera data dominates the bandwidth. If 95% of the bytes are pixels, why not just record a video?
-
-To answer properly, you need to understand what MP4 and H.264 actually are and what tradeoffs they make.
-
-#### How video codecs work (the 60-second version)
-
-**MP4** is a container format (like MCAP). **H.264** (also called AVC) is a compression codec that goes inside MP4 (like CDR goes inside MCAP). H.265/HEVC and VP9/AV1 are newer codecs with better compression.
-
-Video codecs achieve 100-1000x compression (vs raw pixels) through two key tricks:
-
-1. **Spatial compression (intra-frame)** — within a single frame, nearby pixels are similar. Divide the frame into 16x16 blocks, predict each block from its neighbors, and encode only the prediction error. This is similar to JPEG.
-
-2. **Temporal compression (inter-frame)** — consecutive frames are nearly identical. Instead of encoding every frame independently, encode most frames as "the difference from the previous frame." This is where the big wins come from: a static background contributes zero bytes across hundreds of frames.
-
-This creates three types of frames:
-```
-I-frame (keyframe)    — fully self-contained, like a JPEG. Large.
-P-frame (predicted)   — encoded as delta from a previous frame. Small.
-B-frame (bidirectional) — encoded as delta from both past AND future frames. Smallest.
-
-Typical GOP (Group of Pictures):
-I  B  B  P  B  B  P  B  B  P  B  B  P  B  B  I  B  B  P ...
-│                                              │
-└──── keyframe every 30-60 frames ─────────────┘
-```
-
-**The critical consequence:** to decode frame N, you must first decode the nearest preceding I-frame, then every P-frame and B-frame between it and frame N. You can't jump to an arbitrary frame without this chain. This is fundamentally different from MCAP, where every message is independently decodable.
-
-#### What robotics needs vs. what video provides
-
-```
-Requirement                     Video (MP4/H.264)       MCAP + CompressedImage
-─────────────────────────────────────────────────────────────────────────────────
-Per-frame timestamp (ns)        No (fixed frame rate)    Yes (per-message)
-Dropped frame handling          Breaks decode chain      Just a missing message
-Random access to frame N        Decode from last I-frame Direct seek via index
-Pixel-exact values              No (lossy transforms)    Yes (JPEG/PNG are standard)
-Depth images (uint16/float32)   No (designed for 8-bit)  Yes (any dtype)
-Non-image data alongside        Separate file or hack    Same file, same timeline
-Multiple cameras in one file    Separate tracks           Separate topics
-Variable frame rate             Poorly supported          Natural (async messages)
-Compression ratio (RGB)         ~200-500x (H.264)        ~10-50x (per-frame JPEG)
-```
-
-#### Where video codecs break down for robotics
-
-**1. Lossy temporal compression destroys pixel-exact reproducibility.**
-
-H.264 doesn't store your actual pixels — it stores a compressed approximation that looks good to human eyes. Each frame is decoded by applying motion vectors and residuals to a reference frame, accumulating floating-point rounding errors. The exact decoded pixel values depend on the decoder implementation. Two decoders can produce slightly different outputs from the same H.264 stream.
-
-For a YouTube video, this is fine. For a robot learning pipeline where you're computing optical flow, projecting depth points, or training a policy on pixel observations, it's a problem. You need bit-exact reproducibility: the same bytes should always decode to the same pixels. JPEG and PNG inside MCAP give you this.
-
-**2. Depth images are not 8-bit color.**
-
-Video codecs are designed for human-visible light: 8 bits per channel, 3 channels (YUV or RGB). A depth image from a RealSense camera is `uint16` (millimeters) or `float32` (meters) — one channel, 16 or 32 bits, with values like `3042` meaning "3.042 meters." Feeding this through H.264 would:
-- Clamp to 8-bit (0-255), destroying all depth information beyond 2.55 meters
-- Apply perceptual-model-based compression that's optimized for human vision, not distance measurements
-- Introduce spatial artifacts that corrupt the geometric structure
-
-**3. The inter-frame dependency chain is fragile.**
-
-If a camera driver drops frame 47 (common under CPU load), H.264 has a problem: frames 48-59 were encoded as deltas from frame 47. The entire chain is corrupted until the next I-frame. The decoder either produces visual artifacts or must discard the whole group.
-
-In MCAP with per-frame JPEG, a dropped frame is just... a gap. Frame 46 is fine, frame 48 is fine. Nothing depends on frame 47 existing.
-
-**4. Per-frame timestamps are essential, not optional.**
-
-Video formats encode time as a frame rate (30fps) or a timebase with DTS/PTS (decode/presentation timestamps). These work well for playback but have two problems for robotics:
-
-- **Variable capture rate:** a camera running at "30 fps" doesn't actually fire every 33.333ms. Real intervals are 31-36ms due to USB scheduling, exposure time variation, and OS jitter. Video formats either assume fixed rate (wrong) or encode timestamps with limited precision (microseconds, not nanoseconds).
-- **Cross-sensor alignment:** to synchronize a camera frame with an IMU reading, you need to compare their timestamps at sub-millisecond precision. Video timestamps are designed for A/V sync (audio vs video, ~40ms tolerance), not multi-sensor fusion (~1ms tolerance).
-
-#### When video formats ARE useful in robotics
-
-Video formats aren't useless — they serve real purposes in specific contexts:
-
-**Visualization and review.** When a human needs to watch what the robot did, MP4 is great. Foxglove Studio, RViz, and most robot dashboards can render MCAP image topics into video for review. The key point: convert to video for viewing, but store as MCAP for processing.
-
-**Network streaming.** If you're teleoperating a robot over a network link, H.264/H.265 encoding is essential — you can't send 180 MB/s of raw RGB over a typical network. ROS 2 has packages like `image_transport` that do H.264 encoding for real-time streaming, then decode back to raw images on the receiving end. But the recorded data is still stored as individual frames, not as a video stream.
-
-**Long-term archival of visual-only data.** If you have a dataset of 10,000 hours of robot camera footage and you only need the visual data (no depth, no synchronization with other sensors), H.264 compression at 200-500x is much more storage-efficient than per-frame JPEG at 10-50x. Some large-scale datasets (like Ego4D for egocentric video) use MP4 for this reason. But they sacrifice the properties above in exchange for storage savings.
-
-**Diffusion model training on video.** Some recent robot learning approaches (video prediction models, world models) explicitly want video-style data with temporal coherence. These might ingest MP4 directly. But even here, the training pipeline typically decodes to individual frames internally and handles timestamps separately.
-
-#### The bottom line
-
-Video codecs are optimized for a different problem: compressing a single continuous stream of 8-bit color frames for human viewing at a fixed rate. Robotics data is multi-modal, multi-rate, variable-timing, and needs pixel-exact values across diverse dtypes. MCAP with per-frame compression (JPEG for RGB, raw for depth) hits the right tradeoff: good enough compression (~10-50x), full timestamp fidelity, independent frame access, and dtype preservation.
-
-The robotics community arrived at this design through painful experience with video-encoded datasets that broke downstream pipelines in subtle ways (shifted timestamps, decoder-dependent pixel values, corrupted depth channels). The extra storage cost of per-frame encoding is the price of correctness.
+Now that you know what sensors produce, the next question is: how does all this data flow through the robot's software? That's where ROS 2 comes in.
 
 ---
 
 ## 2. ROS 2: The Robot Operating System
-
-Before we get into serialization formats and file layouts, you need to understand what **ROS 2** actually is, because it's the system that defines how all this data is structured.
 
 ### What ROS 2 is (and isn't)
 
@@ -399,7 +316,7 @@ When you open an MCAP file, you're looking at the output of this entire system:
 - **Messages** are CDR-encoded instances of those types
 - **Timestamps** come from both the message header (sensor time) and the recording system (log time)
 
-Understanding this lineage — physical sensor → driver → message type → CDR bytes → DDS transport → MCAP chunk — is what makes the rest of this document make sense.
+Understanding this lineage — physical sensor → driver → message type → CDR bytes → DDS transport → MCAP chunk — is what makes the rest of this document make sense. The next section zooms into Step 3 of the pipeline: how exactly are those structured messages packed into bytes?
 
 ---
 
@@ -511,6 +428,8 @@ The `length` field includes the null terminator. So `"hello"` (5 characters) has
 
 The `count` is the number of elements, not the byte length. Each element follows its own alignment rules. For a `float64[]` sequence, each element is 8-byte aligned.
 
+At this point, you understand how a single message is serialized. But a recording contains millions of messages from dozens of topics. How are they organized into a file? That's the MCAP container format.
+
 ---
 
 ## 4. The MCAP Container Format
@@ -589,91 +508,132 @@ Without chunks, reading a single message near the end of a 10 GB file would requ
 
 MCAP includes CRC-32 checksums in chunks and the footer. This catches data corruption from disk errors, incomplete writes (power loss during recording), or file truncation. When you see "CRC mismatch" errors, it means the data on disk doesn't match what was originally written.
 
----
-
-## 5. ROS 2 Message Types In Depth
-
-This section dives deeper into the specific message types you'll encounter. Section 2 introduced the type system; here we look at the actual fields and what they mean physically.
-
-### The type naming convention
-
-```
-package_name/msg/TypeName
-```
-
-Examples:
-- `sensor_msgs/msg/Image` — raw camera images
-- `sensor_msgs/msg/PointCloud2` — 3D point clouds
-- `sensor_msgs/msg/Imu` — inertial measurements
-- `sensor_msgs/msg/JointState` — robot joint angles/velocities/torques
-- `sensor_msgs/msg/CameraInfo` — camera calibration parameters
-- `tf2_msgs/msg/TFMessage` — coordinate frame transforms
-
-### Imu message definition
-
-```
-std_msgs/Header header
-
-geometry_msgs/Quaternion orientation
-float64[9] orientation_covariance
-
-geometry_msgs/Vector3 angular_velocity
-float64[9] angular_velocity_covariance
-
-geometry_msgs/Vector3 linear_acceleration
-float64[9] linear_acceleration_covariance
-```
-
-This is a hierarchical definition — `Imu` contains a `Header` (which itself contains a `Time` and a `string`), a `Quaternion`, etc. The CDR serializer flattens this hierarchy into a linear byte sequence using depth-first traversal.
-
-```
-std_msgs/Header header
-
-geometry_msgs/Quaternion orientation
-float64[9] orientation_covariance
-
-geometry_msgs/Vector3 angular_velocity
-float64[9] angular_velocity_covariance
-
-geometry_msgs/Vector3 linear_acceleration
-float64[9] linear_acceleration_covariance
-```
-
-This is a hierarchical definition — `Imu` contains a `Header` (which itself contains a `Time` and a `string`), two `Quaternion`s, etc. The CDR serializer flattens this hierarchy into a linear byte sequence using depth-first traversal.
-
-### Type naming convention
-
-```
-package_name/msg/TypeName
-```
-
-Examples:
-- `sensor_msgs/msg/Image` — raw camera images
-- `sensor_msgs/msg/PointCloud2` — 3D point clouds
-- `sensor_msgs/msg/Imu` — inertial measurements
-- `sensor_msgs/msg/JointState` — robot joint angles/velocities/torques
-- `sensor_msgs/msg/CameraInfo` — camera calibration parameters
-- `tf2_msgs/msg/TFMessage` — coordinate frame transforms
-
-### The Header pattern
-
-Nearly every sensor message includes a `std_msgs/Header`:
-
-```
-builtin_interfaces/Time stamp
-string frame_id
-```
-
-- **stamp** — when the measurement was taken (sensor time, not recording time)
-- **frame_id** — which coordinate frame this data lives in (e.g., `"camera_optical_frame"`, `"imu_link"`)
-
-The header is the bridge between the data stream (what was measured) and the spatial system (where it was measured). Without `frame_id`, you can't place the data in 3D space. Without `stamp`, you can't align it with other sensors.
+At this point you understand the full pipeline from sensor to disk. But one question from Section 1 is still dangling: why not just record a video? The answer matters because it shapes how you think about robot data for the rest of this guide.
 
 ---
 
-## 6. Images in Robotics
+## 5. Why Not Just Use Video?
 
-### Raw vs compressed images
+### How video codecs work (the 60-second version)
+
+**MP4** is a container format (like MCAP). **H.264** (also called AVC) is a compression codec that goes inside MP4 (like CDR goes inside MCAP). H.265/HEVC and VP9/AV1 are newer codecs with better compression.
+
+Video codecs achieve 100-1000x compression (vs raw pixels) through two key tricks:
+
+1. **Spatial compression (intra-frame)** — within a single frame, nearby pixels are similar. Divide the frame into 16x16 blocks, predict each block from its neighbors, and encode only the prediction error. This is similar to JPEG.
+
+2. **Temporal compression (inter-frame)** — consecutive frames are nearly identical. Instead of encoding every frame independently, encode most frames as "the difference from the previous frame." This is where the big wins come from: a static background contributes zero bytes across hundreds of frames.
+
+This creates three types of frames:
+```
+I-frame (keyframe)    — fully self-contained, like a JPEG. Large.
+P-frame (predicted)   — encoded as delta from a previous frame. Small.
+B-frame (bidirectional) — encoded as delta from both past AND future frames. Smallest.
+
+Typical GOP (Group of Pictures):
+I  B  B  P  B  B  P  B  B  P  B  B  P  B  B  I  B  B  P ...
+│                                              │
+└──── keyframe every 30-60 frames ─────────────┘
+```
+
+**The critical consequence:** to decode frame N, you must first decode the nearest preceding I-frame, then every P-frame and B-frame between it and frame N. You can't jump to an arbitrary frame without this chain. This is fundamentally different from MCAP, where every message is independently decodable.
+
+### What robotics needs vs. what video provides
+
+```
+Requirement                     Video (MP4/H.264)       MCAP + CompressedImage
+─────────────────────────────────────────────────────────────────────────────────
+Per-frame timestamp (ns)        No (fixed frame rate)    Yes (per-message)
+Dropped frame handling          Breaks decode chain      Just a missing message
+Random access to frame N        Decode from last I-frame Direct seek via index
+Pixel-exact values              No (lossy transforms)    Yes (JPEG/PNG are standard)
+Depth images (uint16/float32)   No (designed for 8-bit)  Yes (any dtype)
+Non-image data alongside        Separate file or hack    Same file, same timeline
+Multiple cameras in one file    Separate tracks           Separate topics
+Variable frame rate             Poorly supported          Natural (async messages)
+Compression ratio (RGB)         ~200-500x (H.264)        ~10-50x (per-frame JPEG)
+```
+
+### Where video codecs break down for robotics
+
+**1. Lossy temporal compression destroys pixel-exact reproducibility.** H.264 doesn't store your actual pixels — it stores a compressed approximation that looks good to human eyes. The exact decoded pixel values depend on the decoder implementation. For training a robot policy on pixel observations, you need bit-exact reproducibility.
+
+**2. Depth images are not 8-bit color.** A depth image is `uint16` (millimeters) or `float32` (meters). Feeding this through H.264 would clamp to 8-bit, destroying all depth beyond 2.55 meters.
+
+**3. The inter-frame dependency chain is fragile.** If a camera driver drops frame 47 (common under CPU load), frames 48-59 are corrupted until the next I-frame. In MCAP with per-frame JPEG, a dropped frame is just a gap.
+
+**4. Per-frame timestamps are essential, not optional.** A camera running at "30 fps" actually fires every 31-36ms due to USB scheduling and OS jitter. Video formats either assume fixed rate (wrong) or encode timestamps with limited precision.
+
+### When video formats ARE useful
+
+- **Visualization and review** — convert to MP4 for watching, store as MCAP for processing
+- **Network streaming** — H.264/H.265 is essential for teleoperation over limited bandwidth
+- **Long-term archival** — for visual-only data at scale, H.264's 200-500x compression beats per-frame JPEG's 10-50x
+- **Video prediction models** — some world model architectures ingest MP4 directly
+
+### The bottom line
+
+Video codecs are optimized for a different problem: compressing a single continuous stream of 8-bit color frames for human viewing at a fixed rate. Robotics data is multi-modal, multi-rate, variable-timing, and needs pixel-exact values across diverse dtypes. MCAP with per-frame compression hits the right tradeoff.
+
+That concludes Part I — you now understand the full journey from physical sensor to bytes on disk. Part II opens the file and looks at what's inside.
+
+---
+
+# Part II — What's Inside a Recording
+
+*You have an MCAP file. You can list its topics, read its schemas, and iterate its messages. But what do those messages actually contain? Part II walks through the sensor data types you'll encounter, then explains the spatial and geometric concepts needed to make sense of them.*
+
+*The sections here are ordered by complexity: simple scalar data first (IMU, joints), then rich spatial data (images, point clouds), then the geometric framework that ties it all together (coordinate frames, quaternions, camera models).*
+
+---
+
+## 6. Sensor Data Types
+
+Each ROS 2 message type has a specific binary layout defined by its `.msg` schema. This section covers the six sensor types you'll encounter most often, in order from simplest to most complex.
+
+### IMU (sensor_msgs/Imu)
+
+The simplest sensor message — all scalar fields, no binary blobs.
+
+An IMU contains:
+- **Accelerometer** — measures linear acceleration along three axes (m/s²). At rest, it reads ~(0, 0, 9.81) due to gravity.
+- **Gyroscope** — measures angular velocity around three axes (rad/s). At rest, it reads ~(0, 0, 0) plus noise.
+- **Magnetometer** (sometimes) — measures magnetic field direction for heading estimation.
+
+Many IMUs also fuse these measurements internally to estimate **orientation** as a quaternion, published in the `orientation` field.
+
+**Why IMU data is tricky:**
+
+**Frame dependence.** The orientation quaternion is in the sensor's local frame. Without a transform to a world frame (`map`, `odom`, or `base_link`), the orientation is not directly useful. The transform tree (Section 7) provides this connection.
+
+**Covariance.** Each measurement comes with a 3×3 covariance matrix expressing uncertainty. A covariance matrix with `[0][0] == -1` is a sentinel meaning "this field is not provided" — the IMU driver doesn't estimate orientation, or the gyro is uncalibrated. Don't treat -1 as an actual covariance value.
+
+**Rate vs accuracy tradeoff.** IMUs sample at 200-1000 Hz — much faster than cameras (30 Hz) or LiDAR (10 Hz). This makes them ideal as the "reference clock" for time synchronization (Section 10). But individual measurements are noisy; their value comes from averaging over many samples.
+
+### Joint States (sensor_msgs/JointState)
+
+The next simplest — variable-length parallel arrays instead of fixed fields.
+
+`sensor_msgs/JointState` carries the state of every actuated joint on a robot:
+
+```
+string[]  name       ["shoulder_pan", "shoulder_lift", "elbow", ...]
+float64[] position   [0.5, -1.2, 0.8, ...]
+float64[] velocity   [0.01, -0.02, 0.0, ...]
+float64[] effort     [12.5, 8.3, 5.1, ...]
+```
+
+**Parallel arrays** — `position[i]` is the position of joint `name[i]`. This is important because:
+
+1. **Joint ordering is not standardized.** Different robot drivers publish joints in different orders. Never assume `position[0]` is the first shoulder joint — always look up by name.
+2. **Arrays may be empty.** A driver that doesn't measure velocity will publish an empty `velocity[]`. Always check the array length before accessing elements.
+3. **Units vary.** Revolute joints are in radians, prismatic joints in meters. Effort is in Newton-meters (torque) for revolute joints and Newtons (force) for prismatic joints.
+
+**Why this matters for robot learning:** In imitation learning and reinforcement learning, the JointState is the **action space** (what the robot did) and part of the **observation space** (what the robot perceived about itself). Aligning joint states with camera images at the correct timestamps is critical — a 50ms misalignment at a joint velocity of 1 rad/s means a 0.05 radian position error, which at the end effector could be centimeters.
+
+### Images (sensor_msgs/Image and CompressedImage)
+
+Now we move from scalar data to binary blobs — the most bandwidth-intensive messages.
 
 Robots typically publish camera data in one of two forms:
 
@@ -681,9 +641,7 @@ Robots typically publish camera data in one of two forms:
 
 **`sensor_msgs/CompressedImage`** — JPEG or PNG compressed pixel data. A typical JPEG of the same scene is 100-500 KB — a 10-50x reduction. This is how most real-world datasets store camera data.
 
-### Encodings
-
-The `encoding` field describes the pixel format:
+**Encodings** — the `encoding` field describes the pixel format:
 
 ```
 Encoding    Dtype      Channels  Use case
@@ -698,45 +656,15 @@ mono16      uint16     1         Depth (millimeters, typically)
 bayer_rggb8 uint8      1         Raw Bayer mosaic (needs demosaicing)
 ```
 
-### The `step` trap
+**The `step` trap:** The `Image` message has both `width` and `step` fields. You might assume `step == width * bytes_per_pixel`, but this is often false. GPU drivers pad each row to a specific alignment (64 or 128 bytes) for efficient SIMD processing. If you reshape using `width * channels` instead of `step`, every row after the first reads the wrong bytes, producing a sheared image.
 
-The `Image` message has both `width` and `step` fields. You might assume `step == width * bytes_per_pixel`, but this is often false. GPU drivers and DMA engines pad each row to a specific alignment (64 or 128 bytes) for efficient SIMD processing.
+**Depth images** are NOT visual images — they're distance measurements per pixel. Never cast them to uint8. A depth pixel value of `3000` in a `mono16` image means "3000mm = 3.0m from the camera." Combined with the camera's intrinsic parameters (Section 9), you can convert this to a 3D point in space.
 
-```
-Width = 641 pixels, 3 channels, uint8
-Expected row bytes: 641 × 3 = 1923
-Actual step: 1984 (padded to 64-byte boundary)
-Padding per row: 61 bytes
-```
+### Point Clouds (sensor_msgs/PointCloud2)
 
-If you reshape using `width * channels` instead of `step`, every row after the first reads the wrong bytes, producing a sheared image with diagonal artifacts. Always use `step` as the row stride.
+The most complex message type — a self-describing binary container with an embedded schema.
 
-### Depth images
-
-Depth cameras (Intel RealSense, Microsoft Azure Kinect) publish depth as `mono16` (millimeters as uint16) or `32FC1` (meters as float32). These are NOT visual images — they're distance measurements per pixel. Never cast them to uint8 (which clips to 0-255), or you lose all depth information beyond 255mm.
-
-A depth pixel value of `3000` in a `mono16` image means "the surface at this pixel is 3000mm = 3.0m from the camera." Combined with the camera's intrinsic parameters, you can convert this to a 3D point in space.
-
----
-
-## 7. 3D Point Clouds
-
-### What is PointCloud2?
-
-`sensor_msgs/PointCloud2` is a universal container for 3D spatial data. Each "point" is a fixed-size binary blob, and the message carries an embedded schema (the `fields` list) describing what each blob contains.
-
-Common configurations:
-
-```
-LiDAR:         x, y, z, intensity, ring, time
-RGB-D camera:  x, y, z, rgb
-Stereo camera: x, y, z
-Semantic:      x, y, z, label, confidence
-```
-
-### The binary layout
-
-Each point is `point_step` bytes. The `fields` list describes where within those bytes each named value lives:
+`sensor_msgs/PointCloud2` is a universal container for 3D spatial data. Each "point" is a fixed-size binary blob, and the message carries a `fields` list describing what each blob contains:
 
 ```
 PointField: name="x",         offset=0,  datatype=FLOAT32, count=1
@@ -746,65 +674,29 @@ PointField: name="intensity", offset=12, datatype=FLOAT32, count=1
 → point_step = 16 bytes
 ```
 
-The data buffer is simply `num_points × point_step` bytes of these packed structs. The most efficient way to decode this is to build a numpy structured dtype from the fields list and call `np.frombuffer` — zero-copy, O(1) decoding regardless of point count.
+The data buffer is `num_points × point_step` bytes. The most efficient decode: build a numpy structured dtype from the fields list and call `np.frombuffer` — zero-copy, O(1) regardless of point count.
 
-### Organized vs unorganized clouds
+**Organized vs unorganized clouds:**
+- **Unorganized** (`height == 1`): a flat list of N points. Typical from spinning LiDAR.
+- **Organized** (`height > 1`): a 2D grid. Typical from depth cameras. Invalid measurements are NaN (when `is_dense == False`).
 
-- **Unorganized** (`height == 1`): a flat list of N points with no spatial structure. Typical output from a spinning LiDAR.
-- **Organized** (`height > 1`): a 2D grid where each (row, col) corresponds to a specific angular or pixel coordinate. Typical from depth cameras or structured-light sensors. Invalid measurements are represented as NaN points (when `is_dense == False`).
+### Camera Info (sensor_msgs/CameraInfo)
 
----
+Not sensor data itself, but the metadata needed to interpret camera data geometrically. `CameraInfo` is almost always published on a sibling topic — `/camera/color/image_raw` pairs with `/camera/color/camera_info`.
 
-## 8. Inertial Measurement Units (IMUs)
+It contains the camera's **intrinsic matrix K**, **distortion coefficients D**, **rectification matrix R**, and **projection matrix P**. We'll explain what these mean in Section 9 (The Pinhole Camera Model).
 
-### What an IMU measures
+### Transforms (tf2_msgs/TFMessage)
 
-An IMU contains:
+The spatial glue that connects everything — explained fully in the next section.
 
-- **Accelerometer** — measures linear acceleration along three axes (m/s²). At rest, it reads ~(0, 0, 9.81) due to gravity.
-- **Gyroscope** — measures angular velocity around three axes (rad/s). At rest, it reads ~(0, 0, 0) plus noise.
-- **Magnetometer** (sometimes) — measures magnetic field direction for heading estimation.
+A `TFMessage` contains a list of `TransformStamped` messages, each describing the position and orientation of one coordinate frame relative to another. These build the **transform tree** — the spatial backbone of the robot.
 
-Many IMUs also fuse these measurements internally to estimate **orientation** as a quaternion, published in the `orientation` field.
-
-### Why IMU data is tricky
-
-**Frame dependence.** The orientation quaternion is in the sensor's local frame. Without a transform to a world frame (`map`, `odom`, or `base_link`), the orientation is not directly useful. The transform tree (Section 9) provides this connection.
-
-**Covariance.** Each measurement comes with a 3×3 covariance matrix expressing uncertainty. A covariance matrix with `[0][0] == -1` is a sentinel meaning "this field is not provided" — the IMU driver doesn't estimate orientation, or the gyro is uncalibrated. Don't treat -1 as an actual covariance value.
-
-**Rate vs accuracy tradeoff.** IMUs sample at 200-1000 Hz — much faster than cameras (30 Hz) or LiDAR (10 Hz). This makes them ideal as the "reference clock" for time synchronization. But individual measurements are noisy; their value comes from averaging over many samples (via Kalman filtering or complementary filtering).
+All six sensor types above include a `frame_id` in their header, saying "this data was measured in frame X." But what does that mean spatially? How do you combine an IMU reading in `imu_link` with a camera image in `camera_optical_frame`? You need the transform tree. That's where we go next.
 
 ---
 
-## 9. Joint States and Robot Kinematics
-
-### What JointState contains
-
-`sensor_msgs/JointState` carries the state of every actuated joint on a robot:
-
-```
-string[]  name       ["shoulder_pan", "shoulder_lift", "elbow", ...]
-float64[] position   [0.5, -1.2, 0.8, ...]
-float64[] velocity   [0.01, -0.02, 0.0, ...]
-float64[] effort     [12.5, 8.3, 5.1, ...]
-```
-
-### Parallel arrays
-
-The four fields are **parallel arrays** — `position[i]` is the position of joint `name[i]`. This is important because:
-
-1. **Joint ordering is not standardized.** Different robot drivers publish joints in different orders. Never assume `position[0]` is the first shoulder joint — always look up by name.
-2. **Arrays may be empty.** A driver that doesn't measure velocity will publish an empty `velocity[]`. Always check the array length before accessing elements.
-3. **Units vary.** Revolute joints are in radians, prismatic joints in meters. Effort is in Newton-meters (torque) for revolute joints and Newtons (force) for prismatic joints.
-
-### Why this matters for robot learning
-
-In imitation learning and reinforcement learning, the JointState is the **action space** (what the robot did) and part of the **observation space** (what the robot perceived about itself). Aligning joint states with camera images at the correct timestamps is critical — a 50ms misalignment at a joint velocity of 1 rad/s means a 0.05 radian position error, which at the end effector could be centimeters.
-
----
-
-## 10. Coordinate Frames and Transforms
+## 7. Where Things Are: Coordinate Frames and Transforms
 
 ### The problem
 
@@ -852,11 +744,15 @@ Static transforms are published once and apply at all timestamps. Dynamic transf
 
 A camera image arrives at t = 1.005s. The most recent `odom → base_link` transforms were published at t = 1.00s and t = 1.01s. To get the transform at exactly t = 1.005s, you interpolate:
 - **Translation**: linear interpolation (LERP)
-- **Rotation**: spherical linear interpolation (SLERP) — see Section 10
+- **Rotation**: spherical linear interpolation (SLERP)
+
+But what is SLERP, and why can't you just linearly interpolate a rotation? That requires understanding how rotations are represented — which brings us to quaternions.
 
 ---
 
-## 11. Quaternions and 3D Rotations
+## 8. Quaternions and 3D Rotations
+
+*This section is the mathematical foundation for transforms (Section 7) and camera projection (Section 9). If you're comfortable with rotation matrices and quaternions, skip to the convention warning at the end — it'll save you the most common bug.*
 
 ### Why not Euler angles?
 
@@ -909,7 +805,7 @@ This reverses the rotation. `q * q⁻¹ = identity`.
 
 ### SLERP: Spherical Linear Interpolation
 
-To interpolate between two rotations (e.g., for transform interpolation), you need SLERP:
+This is why we're here — Section 7 said transforms need interpolation, and rotations can't be interpolated linearly.
 
 ```
 slerp(q1, q2, t) = q1 * sin((1-t)θ) / sin(θ)  +  q2 * sin(tθ) / sin(θ)
@@ -917,7 +813,7 @@ slerp(q1, q2, t) = q1 * sin((1-t)θ) / sin(θ)  +  q2 * sin(tθ) / sin(θ)
 
 where θ = arccos(q₁ · q₂).
 
-**Why not just LERP and normalize?** Linear interpolation (NLERP) — `normalize((1-t)*q1 + t*q2)` — works but produces **non-uniform angular velocity**. The rotation speeds up in the middle and slows at the ends. SLERP traverses the great-circle arc on the unit 4-sphere at constant speed, which is physically correct for smooth motion.
+**Why not just LERP and normalize?** Linear interpolation (NLERP) — `normalize((1-t)*q1 + t*q2)` — works but produces **non-uniform angular velocity**. The rotation speeds up in the middle and slows at the ends. SLERP traverses the great-circle arc at constant speed, which is physically correct for smooth motion.
 
 For very small angles (θ ≈ 0), SLERP's formula becomes numerically unstable (dividing by sin(θ) ≈ 0). In this case, fall back to NLERP — the difference is negligible for small angles.
 
@@ -925,9 +821,13 @@ For very small angles (θ ≈ 0), SLERP's formula becomes numerically unstable (
 
 ROS uses `(x, y, z, w)` ordering. SciPy uses `(w, x, y, z)` (scalar-first). This is the single most common source of quaternion bugs. Pick one convention internally and convert at the boundaries.
 
+Now you understand both the transform tree (Section 7) and the math behind it. There's one more geometric concept needed before we can combine all our sensor data: the camera model, which connects the 3D world to 2D images.
+
 ---
 
-## 12. The Pinhole Camera Model
+## 9. The Pinhole Camera Model
+
+*Images (Section 6) give you pixels. Transforms (Section 7) give you 3D positions. The camera model is the bridge between them: it defines how a 3D point in the world maps to a pixel in the image, and vice versa. This is where CameraInfo (from Section 6) gets used.*
 
 ### The basic model
 
@@ -976,7 +876,7 @@ K = [fx, 0, cx, 0, fy, cy, 0, 0, 1]
 
 Real lenses bend light in ways the pinhole model doesn't capture. The two main types:
 
-**Radial distortion** — straight lines in the world appear curved in the image. Barrel distortion (common in wide-angle lenses) pushes pixels outward. Pincushion distortion pushes them inward.
+**Radial distortion** — straight lines in the world appear curved in the image. Barrel distortion (common in wide-angle lenses) pushes pixels outward.
 
 ```
 Undistorted:  ┌────────────┐     Barrel:  ╭────────────╮
@@ -986,7 +886,7 @@ Undistorted:  ┌────────────┐     Barrel:  ╭──�
               └────────────┘              ╰────────────╯
 ```
 
-**Tangential distortion** — the lens is not perfectly parallel to the image sensor, causing a slight tilt in the projected image.
+**Tangential distortion** — the lens is not perfectly parallel to the image sensor.
 
 The distortion coefficients are stored in the **D** vector:
 
@@ -995,20 +895,18 @@ plumb_bob model:       D = [k1, k2, p1, p2, k3]
 rational_polynomial:   D = [k1, k2, p1, p2, k3, k4, k5, k6]
 ```
 
-Where k1, k2, k3 are radial coefficients and p1, p2 are tangential coefficients.
-
 ### Why distortion matters
 
-For a standard 60° FOV camera, distortion is minor — maybe 1-2 pixels at the edges. For a wide-angle (120°+) or fisheye lens, distortion can be 50+ pixels. If you project a 3D point to pixels without accounting for distortion, it will land in the wrong place. If you triangulate two camera views without undistorting, your 3D reconstruction will be warped.
+For a standard 60° FOV camera, distortion is minor — maybe 1-2 pixels at the edges. For a wide-angle (120°+) or fisheye lens, distortion can be 50+ pixels. If you project a 3D point to pixels without accounting for distortion, it will land in the wrong place.
 
-**Undistortion** removes distortion from an image, making straight world lines appear straight in the image. This is done with `cv2.undistort()` using K and D.
+**Undistortion** removes distortion from an image using `cv2.undistort()` with K and D.
 
 ### The R and P matrices
 
 In `CameraInfo`:
 
-- **R** (3×3) — the **rectification matrix**. For monocular cameras, this is identity. For stereo cameras, it rotates each camera's image plane so that epipolar lines are horizontal (essential for stereo matching).
-- **P** (3×4) — the **projection matrix** for the rectified image. P = K' × [R | t], where K' is the new intrinsic matrix after rectification. For monocular cameras, P is just K with a zero column appended.
+- **R** (3×3) — the **rectification matrix**. For monocular cameras, this is identity. For stereo cameras, it rotates each camera's image plane so that epipolar lines are horizontal.
+- **P** (3×4) — the **projection matrix** for the rectified image. For monocular cameras, P is just K with a zero column appended.
 
 ### Projection and unprojection
 
@@ -1028,9 +926,19 @@ In `CameraInfo`:
 2. 3D point:     X = x' * d,  Y = y' * d,  Z = d
 ```
 
+That wraps up Part II. You now know what every sensor message contains, how frames relate to each other in 3D space, how rotations work, and how cameras project the 3D world onto 2D images. But all of this assumes the data is from the same instant in time. In reality, each sensor fires independently at its own rate. Part III tackles the hard problem: making asynchronous sensor data work together.
+
 ---
 
-## 13. Time, Clocks, and Synchronization
+# Part III — Making the Data Useful
+
+*You can open an MCAP file, decode every message type, and understand the spatial relationships between sensors. But the data is still raw: asynchronous streams at different rates, potentially hours long, with no structure beyond chronological order. Part III covers the three transformations needed to turn raw recordings into training-ready datasets: temporal alignment, episode segmentation, and structured export.*
+
+---
+
+## 10. Time, Clocks, and Synchronization
+
+This is the payoff section. Everything in Parts I and II builds toward this: **how do you combine data from different sensors that fire at different rates with different clocks?**
 
 ### The clock problem
 
@@ -1053,11 +961,11 @@ Every MCAP message carries two timestamps:
 
 **`header.stamp`** — the sensor-side timestamp embedded in the ROS message payload. For a properly written driver, this is the **capture time** — when the camera shutter fired, when the IMU sample-and-hold circuit latched, when the LiDAR pulse returned.
 
-**For cross-sensor alignment, always use `header.stamp`.** It reflects when the physical measurement was taken, not when the software happened to process it. The difference between the two (`log_time - header.stamp`) is the **pipeline latency**, which varies per message.
+**For cross-sensor alignment, always use `header.stamp`.** The difference between the two (`log_time - header.stamp`) is the **pipeline latency**, which varies per message.
 
 ### Synchronization strategies
 
-**Nearest-neighbor**: for each reference timestamp, find the closest message from each other topic. Simple and preserves original measurements, but the matched message can be up to half a sampling period old (e.g., 16ms for a 30Hz camera).
+**Nearest-neighbor**: for each reference timestamp, find the closest message from each other topic. Simple and preserves original measurements, but the matched message can be up to half a sampling period old.
 
 ```
 Reference (IMU, 200Hz):  ─────●─────●─────●─────●─────●─────●─────
@@ -1066,11 +974,11 @@ Camera (30Hz):            ─────────────●────
                           nearest match for each IMU sample
 ```
 
-**Interpolation**: find the two messages bracketing the reference timestamp and interpolate between them. Produces a "virtual sample" at the exact reference time.
+**Interpolation**: find the two messages bracketing the reference timestamp and interpolate. Produces a "virtual sample" at the exact reference time.
 
 - Scalar values (position, velocity): **linear interpolation**
-- Orientations (quaternions): **SLERP** (see Section 10)
-- Images: **not interpolatable** — use nearest-neighbor instead
+- Orientations (quaternions): **SLERP** (Section 8 — this is why we covered it)
+- Images: **not interpolatable** — use nearest-neighbor
 
 ### Max delay thresholds
 
@@ -1092,7 +1000,9 @@ After synchronization, compute:
 
 ---
 
-## 14. Episodes and Dataset Structure
+## 11. Episodes and Dataset Structure
+
+Now that you can synchronize sensor streams, the next question is: where does one task end and the next begin?
 
 ### What is an episode?
 
@@ -1127,7 +1037,9 @@ Understanding MCAP deeply gives you the foundation to convert to/from any of the
 
 ---
 
-## 15. Columnar Storage with Parquet
+## 12. Columnar Storage with Parquet
+
+The final step: exporting synchronized, episodic data into a format optimized for ML consumption.
 
 ### Why Parquet for robot data?
 
@@ -1153,9 +1065,7 @@ When you query `SELECT joint1, joint2 FROM data`, a columnar format reads only t
 
 ### Images in Parquet
 
-A key design decision: **store images as compressed bytes (JPEG/PNG), not as expanded pixel arrays**. A 1920×1080 RGB8 image is 6.2 MB as raw pixels but 100-500 KB as JPEG. Storing raw pixels in Parquet would make the file 10-50x larger for no benefit — you'd still need to convert to a numpy array at load time.
-
-The Parquet schema for an image column is simply `BYTE_ARRAY` containing the JPEG/PNG bytes. The loader decompresses at read time.
+A key design decision: **store images as compressed bytes (JPEG/PNG), not as expanded pixel arrays**. A 1920×1080 RGB8 image is 6.2 MB as raw pixels but 100-500 KB as JPEG. The Parquet schema for an image column is simply `BYTE_ARRAY` containing the JPEG/PNG bytes. The loader decompresses at read time.
 
 ### Parquet schema design for common types
 
@@ -1180,43 +1090,45 @@ PointCloud: timestamp_ns (int64), frame_id (string),
 
 ---
 
-## 16. Putting It All Together
+## 13. Putting It All Together
 
 Here's how all these concepts connect when you process a real robot recording:
 
 ```
-1. OPEN the MCAP file
+1. OPEN the MCAP file                               [Section 4]
    → Read the summary section (schemas, channels, statistics)
    → No message data touched yet
 
-2. ITERATE messages
+2. ITERATE messages                                  [Sections 3-4]
    → Decompress chunks on demand
    → Deserialize CDR bytes into typed Python objects
    → Each message has a topic, schema, timestamp, and frame_id
 
-3. PARSE message types
+3. PARSE message types                               [Section 6]
    → Image: reshape bytes into numpy array using step and encoding
    → PointCloud2: build structured dtype, zero-copy np.frombuffer
    → IMU: extract quaternion, angular velocity, linear acceleration
    → JointState: parallel arrays keyed by joint name
    → CameraInfo: intrinsic matrix K, distortion D
 
-4. BUILD the transform tree
+4. BUILD the transform tree                          [Sections 7-8]
    → Ingest TFMessage from /tf and /tf_static
    → Build frame graph, store timestamped transforms
-   → Answer queries: "what's the transform from camera to base_link at t=5.3s?"
+   → Answer queries: "what's the transform from camera to
+     base_link at t=5.3s?" (using SLERP for rotation interpolation)
 
-5. SYNCHRONIZE across sensors
+5. SYNCHRONIZE across sensors                        [Section 10]
    → Pick a reference topic (usually the fastest sensor)
-   → For each reference timestamp, find nearest/interpolated match per topic
+   → For each reference timestamp, find nearest/interpolated
+     match per topic
    → Track sync quality (delays, drops)
 
-6. DETECT episodes
+6. DETECT episodes                                   [Section 11]
    → Find gaps in the message stream
    → Or use marker topics (/episode_start, /episode_end)
    → Compute per-episode metadata (duration, message counts, success)
 
-7. EXPORT for downstream use
+7. EXPORT for downstream use                         [Section 12]
    → Write to Parquet with type-appropriate schema
    → Images as compressed bytes, scalars as native columns
    → One row per synchronized timestamp
@@ -1226,7 +1138,7 @@ Each of these steps builds on the concepts covered in this document. The code in
 
 ---
 
-## 17. Further Reading
+## 14. Further Reading
 
 ### Specifications and standards
 - [MCAP format specification](https://mcap.dev/spec) — the official byte-level format definition
