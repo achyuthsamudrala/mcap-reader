@@ -1088,6 +1088,60 @@ PointCloud: timestamp_ns (int64), frame_id (string),
             data (bytes, raw or compressed)
 ```
 
+### Why Parquet and not Lance, TFRecord, or HDF5?
+
+If you come from ML infrastructure, you've probably encountered several data formats that seem like they'd fit robot data. Here's how they compare and why Parquet is the current default for export — even though none of them are perfect.
+
+**Lance** is the most interesting alternative. Built by LanceDB, it's a columnar format designed specifically for ML workloads — with native support for vector embeddings, fast random access to individual rows (O(1) via row IDs), versioned datasets, and efficient append/update operations. Parquet was designed for analytics (scan large ranges of rows); Lance was designed for training (random-access individual samples).
+
+```
+                    Parquet             Lance               TFRecord            HDF5
+────────────────────────────────────────────────────────────────────────────────────────────
+Designed for        Analytics           ML training          TF pipelines        Scientific data
+Access pattern      Sequential scan     Random row access    Sequential scan     Random access
+Append/update       Rewrite file        In-place versioned   Append-only         In-place update
+Column pushdown     Yes                 Yes                  No                  Partial
+Nested types        Yes (struct/list)   Yes                  Yes (protobuf)      Yes (groups)
+Binary blobs        BYTE_ARRAY          BLOB (ext storage)   bytes_list          opaque dtype
+Vector search       No                  Native (ANN index)   No                  No
+Row-level access    Slow (scan to row)  O(1) by row ID       Slow (scan)         O(1) by index
+Ecosystem           Universal           Growing              TensorFlow-only     Broad (science)
+Compression         Zstd/Snappy/LZ4     Zstd                 Gzip/Zstd           Gzip/LZF/Zstd
+Mutability          Immutable           Versioned (MVCC)     Immutable           Mutable
+```
+
+**Where Lance would be better than Parquet for robot data:**
+
+- **Random-access training.** PyTorch `DataLoader` with `shuffle=True` needs random access to individual samples. With Parquet, this means either loading the entire file into memory or accepting slow seeks. Lance gives O(1) row access by ID — exactly what `__getitem__(idx)` needs. For large robot datasets (10k+ episodes), this is the difference between a fast and painfully slow training loop.
+
+- **Versioned datasets.** You discover that episodes 500-520 had bad calibration and want to mark them as excluded. With Parquet, you rewrite the entire file. Lance supports zero-copy versioning — tag a new version with those rows filtered out, and the old version is still accessible. For iterative dataset curation (which is where the field is heading), this is transformative.
+
+- **Embedding search across episodes.** "Find me episodes similar to this one" requires computing embeddings over observations and searching nearest neighbors. Lance has a built-in ANN vector index. With Parquet, you'd need a separate vector database (Pinecone, Milvus, etc.) alongside your data.
+
+- **Append without rewrite.** New recordings come in daily from a robot fleet. With Parquet, you either maintain one massive file (expensive to rewrite) or a directory of small files (fragmented reads). Lance handles appends natively with automatic compaction.
+
+**Where Parquet is still the right choice:**
+
+- **Universality.** Every tool reads Parquet — pandas, Spark, DuckDB, Polars, Arrow, BigQuery, Snowflake. Lance is growing but not yet universally supported. If your downstream consumer is unknown, Parquet is the safe bet.
+
+- **Analytics and aggregation.** "What's the mean sync delay across all episodes?" is a scan query that Parquet is optimized for. Lance optimizes for point lookups, not full-table aggregations.
+
+- **Maturity and trust.** Parquet has been battle-tested for a decade at petabyte scale. Lance is newer and still stabilizing its format spec. For archival data that needs to be readable in 5 years, Parquet is lower risk.
+
+- **Interoperability with existing robotics tools.** LeRobot uses Parquet. Most ROS 2 data analysis tools export to Parquet. The ecosystem expects it.
+
+**Where TFRecord falls short:**
+
+TFRecord is a sequential format — it has no index, no column pushdown, and no random access without scanning. It exists because TensorFlow's `tf.data` pipeline was designed around sequential reads with prefetching. For any access pattern beyond "iterate from start to end," it's painful. The robotics community has largely moved away from TFRecord except in Google-adjacent projects (RLDS, RT-X).
+
+**Where HDF5 falls short:**
+
+HDF5 supports random access and nested data, which is why robomimic and LIBERO used it. But it has terrible concurrent read performance (the global lock problem), poor compression compared to Parquet/Lance, and no column pushdown. It also doesn't compose well with distributed training — multiple workers reading the same HDF5 file will contend on the lock.
+
+**The practical answer today:**
+
+Use Parquet for export and interchange — it's the lingua franca. Watch Lance closely — its random-access and versioning properties are exactly what robot learning datasets will need as they scale from "one researcher, one dataset" to "fleet of robots, continuously curated data." The transition will likely happen in 2026-2027 as Lance's ecosystem matures and robot datasets grow large enough that Parquet's sequential-scan model becomes the bottleneck.
+
 ---
 
 ## 13. Putting It All Together
